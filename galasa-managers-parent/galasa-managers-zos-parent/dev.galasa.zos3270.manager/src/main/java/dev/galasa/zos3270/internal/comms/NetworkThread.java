@@ -205,6 +205,11 @@ public class NetworkThread extends Thread {
                 logger.trace("SSCP_LU_DATA received");
                 logger.trace("Received message header: " + reportCommandSoFar());
                 logger.trace("Received message buffer: " + Hex.encodeHexString(buffer));
+
+                buffer.get(new byte[4]);
+
+                Inbound3270Message inbound3270Message = process3270Data(buffer);
+                this.screen.processInboundMessage(inbound3270Message);
                 return;
             }
 
