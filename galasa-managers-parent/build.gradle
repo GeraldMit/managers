@@ -20,18 +20,18 @@ configurations {
 //  Get all the sub projects with jacoco plugin to add itself to the merge 
 subprojects {
    plugins.withId('jacoco')  {
-        rootProject.tasks.named('jacocoMerge').get().executionData(tasks.named('test').get())
+        rootProject.tasks.named('jacocoReport').get().executionData(tasks.named('test').get())
    }
 }
 
 // Define the artifact
-def execFile = layout.buildDirectory.file('jacoco/jacocoMerge.exec')
+def execFile = layout.buildDirectory.file('jacoco/jacocoReport.exec')
 def execArtifact = artifacts.add('archives', execFile.get().asFile) {
-    builtBy 'jacocoMerge'
+    builtBy 'jacocoReport'
 }
 
 
-task jacocoMerge(type: JacocoMerge) {
+task jacocoMerge(type: JacocoReport) {
     doFirst {
         // go through all the files and remove the ones that do not exist.   some managers do not have unit tests yet
         executionData = executionData.filter({f -> f.exists()})
