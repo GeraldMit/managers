@@ -5,164 +5,298 @@
  */
 package dev.galasa.db2.internal;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.Field;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.sql.Connection;
+import java.sql.DriverManager;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
-
-import javax.validation.constraints.NotNull;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.osgi.service.component.annotations.Component;
+import org.osgi.framework.Bundle;
+import org.osgi.framework.BundleContext;
+import org.osgi.framework.FrameworkUtil;
 
-import dev.galasa.ManagerException;
-import dev.galasa.db2.Db2Instance;
+import dev.galasa.ICredentialsUsernamePassword;
 import dev.galasa.db2.Db2ManagerException;
-import dev.galasa.db2.Db2ManagerField;
-import dev.galasa.db2.Db2Schema;
 import dev.galasa.db2.IDb2Instance;
-import dev.galasa.db2.IDb2Schema;
+import dev.galasa.db2.internal.properties.Db2Credentials;
+import dev.galasa.db2.internal.properties.Db2DSEInstanceName;
+import dev.galasa.db2.internal.properties.Db2InstanceUrl;
 import dev.galasa.db2.internal.properties.Db2PropertiesSingleton;
-import dev.galasa.db2.spi.IDb2ManagerSpi;
-import dev.galasa.framework.spi.AbstractManager;
-import dev.galasa.framework.spi.AnnotatedField;
 import dev.galasa.framework.spi.ConfigurationPropertyStoreException;
-import dev.galasa.framework.spi.GenerateAnnotatedField;
+import dev.galasa.framework.spi.IConfigurationPropertyStoreService;
 import dev.galasa.framework.spi.IFramework;
-import dev.galasa.framework.spi.IManager;
-import dev.galasa.framework.spi.ResourceUnavailableException;
-import dev.galasa.framework.spi.language.GalasaTest;
+import dev.galasa.framework.spi.creds.CredentialsException;
+import dev.galasa.framework.spi.cps.CpsProperties;
 
 /**
- * Db2 Manager Impl
+ * The Db2Instance will establish a connection to a database and must be created
+ * for a IDb2Schema to be established.
  * 
- * Provides two annotations, one for a Db2 Instance connections and one for
- * a Schema impl
+ * This instance also provides the connection itself back to the tester for any
+ * complex usecases not covered by the methods inside this manager.
  * 
  * @author jamesdavies
  *
  */
-@Component(service = { IManager.class })
-public class Db2ManagerImpl extends AbstractManager implements IDb2ManagerSpi{
-	private IFramework 							framework;
-	
-	private Map<String,Db2InstanceImpl> 					connections = new HashMap<>();
-	
-	protected final String               		NAMESPACE = "db2";
-    private final static Log                    logger = LogFactory.getLog(Db2ManagerImpl.class);
-    
-    @Override
-    public void initialise(@NotNull IFramework framework, @NotNull List<IManager> allManagers,
-            @NotNull List<IManager> activeManagers, @NotNull GalasaTest galasaTest) throws ManagerException {
-    	super.initialise(framework, allManagers, activeManagers, galasaTest);
-    	this.framework = framework;
-    	
-    	if(galasaTest.isJava()) {
-    		List<AnnotatedField> annotatedFields = findAnnotatedFields(Db2ManagerField.class);
-    		if(!annotatedFields.isEmpty()) {
-    			youAreRequired(allManagers, activeManagers, galasaTest);
-    		}
-    	}
-    	try {
-    		Db2PropertiesSingleton.setCps(framework.getConfigurationPropertyService(NAMESPACE));
-    	} catch(ConfigurationPropertyStoreException e) {
-    		throw new Db2ManagerException("Failed to set CPS for the 'db2' namespace", e);
-    	}
-    	logger.info("Db2 manager initialised");
-    }
+public class Db2InstanceImpl implements IDb2Instance {
+	private Connection conn;
 
-	@Override
-	public void youAreRequired(@NotNull List<IManager> allManagers, @NotNull List<IManager> activeManagers, @NotNull GalasaTest galasaTest)
-	        throws ManagerException {
-		if (activeManagers.contains(this)) {
-			return;
+	private static final Log logger = LogFactory.getLog(Db2InstanceImpl.class);
+
+	public Db2InstanceImpl(IFramework framework, Db2ManagerImpl manager, String tag) throws Db2ManagerException{
+		String instance = Db2DSEInstanceName.get(tag);
+		try {
+			//Check Db2 classes for the driver
+			Class.forName("com.ibm.db2.jcc.DB2Driver");
+			//Get the credentials
+			ICredentialsUsernamePassword creds = (ICredentialsUsernamePassword)framework.getCredentialsService().getCredentials(Db2Credentials.get(instance));
+			//Get the JDBC URL
+			//URL will need to include sslConnection and sslCertLocation like 
+			// sslConnection=true;sslCertLocation=./common_cacert;
+			// ex. "jdbc:db2://mysever/DBD1LOC:sslConnection=true;sslCertLocation=~/.galasa/common_cacert;";
+			// to set URL for the data source
+			//Load the Db2 license jar, if present
+			// ex. "jdbc:db2://mysever/DBD1LOC:sslConnection=true;sslCertLocation=~/.galasa/common_cacert;licenseJar=~/.galasa/db2jcc_license_cisuz.jar";
+			String url = retrieveDb2UrlAndLoadDb2LicenseJar(framework, instance, tag);
+			//Create connection
+			conn = DriverManager.getConnection(url, creds.getUsername(), creds.getPassword());
+		} catch (ClassNotFoundException e) {
+			throw new Db2ManagerException("Could not load the com.ibm.db2.jcc.DB2Driver", e);
+		} catch (SQLException e) {
+			throw new Db2ManagerException("Failed to connect to " + instance, e);
+		} catch (CredentialsException e) {
+			throw new Db2ManagerException("Failed to find an Credentials for: " + instance, e);
 		}
-        activeManagers.add(this);
 	}
-	
-	@Override
-	public void provisionGenerate() throws ManagerException, ResourceUnavailableException {
-		logger.info("Db2 Manager provision Generating");
-		List<AnnotatedField> annotatedFields = findAnnotatedFields(Db2ManagerField.class);
-    	
-    	for(AnnotatedField annotatedField : annotatedFields) {
-    		Field field = annotatedField.getField();
-    		if(field.getType() == IDb2Instance.class) {
-    			Db2Instance annotation = field.getAnnotation(Db2Instance.class);
-    			if(annotation != null) {
-    				generateDb2Instance(field, annotatedField.getAnnotations());
-    			}
-    			
-    		}
-    	}
-        generateAnnotatedFields(Db2ManagerField.class);
+
+	public String retrieveDb2UrlAndLoadDb2LicenseJar(IFramework framework, String instance, String tag) throws Db2ManagerException{
+		//load from the JDBC Url
+		final String db2url = Db2InstanceUrl.get(instance);
+		String licenseJarDb2UriLoc = licenseJarLocationInDb2ConnectionURI(db2url);
+		if(licenseJarLoad("Env", licenseJarDb2UriLoc)) {
+			String db2urlPrime = removeLicenseJarLocationFromDb2ConnectionURI(db2url);
+			return db2urlPrime;
+		}
+		// load from the Galasa properties settings
+		try {
+			IConfigurationPropertyStoreService cpss = Db2PropertiesSingleton.cps();
+			String licenseJarCpsLoc = cpss.getProperty("instance", "license", tag);
+			if (licenseJarLoad("CPS", licenseJarCpsLoc)) {
+				return db2url;
+			}
+		} catch (ConfigurationPropertyStoreException e) {
+			throw new Db2ManagerException("Load the ConfigurationPropertyStore", e);
+		}
+		//load JVM properties
+		String licenseJarJvmLoc = getDb2LicenseJarJVMPropertyLocation();
+		if (licenseJarLoad("JVM", licenseJarJvmLoc)) {
+			return db2url;
+		}
+		//load System Environment
+		String licenseJarEnvLoc = getDb2LicenseJarSystemEnvironmentLocation();
+		if (licenseJarLoad("Env", licenseJarEnvLoc)) {
+			return db2url;
+		}
+		//load default
+		String licenseJarDefaultLoc = getDb2LicenseJarDefaultLocation();
+		licenseJarLoad("Default", licenseJarDefaultLoc);
+		return db2url;
 	}
-	
-	@Override
-	public void provisionDiscard() {
-		for (String db2Tag : connections.keySet()) {
-			logger.info("Closing connection to " + db2Tag);
+
+	private boolean licenseJarLoad(String origin, String licenseJarLoc) {
+		logger.info("licenseJarLoad()  location: " + ((licenseJarLoc == null) ? "null" : licenseJarLoc));
+		System.out.println("licenseJarLoad()  location: " + ((licenseJarLoc == null) ? "null" : licenseJarLoc));
+		URI uri = getFileURI(licenseJarLoc);
+		if (uri != null) {
 			try {
-				connections.get(db2Tag).getConnection().close();
-			} catch (SQLException e) {
-				logger.error("Failed to close connection", e);
+				install(uri);
+			} catch (Exception e) {
+				//may not be fatal? 
+				logger.info("licenseJarLoad() Exception on install: "+ e.getMessage());
+				System.out.println("licenseJarLoad() Exception on install: "+ e.getMessage());
+				e.printStackTrace();
+			}
+			return checkLicenseIsInstalled();
+		}
+		return false;
+	}
+
+	public boolean checkLicenseIsInstalled() {
+		try {
+			// Check Db2 classes for the license
+			Class<?> clazz = Class.forName("com.ibm.db2.jcc.licenses.DB2zOS");
+			logger.info("Loaded the Db2 license jar classes");
+			System.out.println("Loaded the Db2 license jar classes");
+			return true;
+		} catch (ClassNotFoundException | LinkageError e) {
+			// ClassNotFoundException - if the class cannot be located
+			// ExceptionInInitializerError - if the initialization fails
+			// LinkageError - if the linkage fails
+			logger.info("Could not load the Db2 license jar classes");
+			System.out.println("Could not load the Db2 license jar classes");
+
+		}
+		return false;
+	}
+
+	public String getDb2LicenseJarDefaultLocation() {
+		// Default
+		String licenseJarDefaultLocation = "~/.galasa/db2jcc_license_cisuz.jar";
+		logger.info("getDb2LicenseJarLocation() default location: " + licenseJarDefaultLocation);
+		System.out.println("getDb2LicenseJarLocation() default location: " + licenseJarDefaultLocation);
+		return licenseJarDefaultLocation;
+	}
+
+	public String getDb2LicenseJarSystemEnvironmentLocation() {
+		// Check System level environment variables
+		try {
+			String licenseJarEnvLoc = System.getenv("GALASADB2JCCLICENSEJAR");
+			if (null != licenseJarEnvLoc) {
+				logger.info("getDb2LicenseJarLocation() environment location: " + licenseJarEnvLoc);
+				System.out.println("getDb2LicenseJarLocation() environment location: " + licenseJarEnvLoc);
+				return licenseJarEnvLoc;
+			}
+		} catch (RuntimeException e) {
+			logger.info("getDb2LicenseJarLocation() RuntimeException on GALASADB2JCCLICENSEJAR retrieval");
+			System.out.println("getDb2LicenseJarLocation() RuntimeException on GALASADB2JCCLICENSEJAR retrieval");
+			e.printStackTrace();
+		}
+		return null;
+	}
+
+	public String getDb2LicenseJarJVMPropertyLocation() {
+		// Check JVM level properties
+		try {
+			String licenseJarPropLoc = System.getProperty("GALASADB2JCCLICENSEJAR");
+			if (null != licenseJarPropLoc) {
+				logger.info("getDb2LicenseJarLocation() property location: " + licenseJarPropLoc);
+				System.out.println("getDb2LicenseJarLocation() property location: " + licenseJarPropLoc);
+				return licenseJarPropLoc;
+			}
+		} catch (RuntimeException e) {
+			logger.info("getDb2LicenseJarLocation() RuntimeException on GALASADB2JCCLICENSEJAR retrieval");
+			System.out.println("getDb2LicenseJarLocation() RuntimeException on GALASADB2JCCLICENSEJAR retrieval");
+			e.printStackTrace();
+		}
+		return null;
+	}
+
+	public String licenseJarLocationInDb2ConnectionURI(String db2url) {
+		String[] values = db2url.split(";");
+		for (String value : values) {
+			if (value.contains("db2jcc_license_cisuz.jar")) {
+				String[] keyval = value.split("=");
+				String licUriString = keyval[keyval.length - 1];
+				return licUriString;
 			}
 		}
+		return null;
 	}
-	
-	@GenerateAnnotatedField(annotation = Db2Instance.class)
-	public IDb2Instance generateDb2Instance(Field field, List<Annotation> annotations) throws Db2ManagerException {
-		Db2Instance annotation = field.getAnnotation(Db2Instance.class);
-		
-		Db2InstanceImpl instance = new Db2InstanceImpl(framework, this, annotation.tag());
-		connections.put(annotation.tag(), instance);
-		registerAnnotatedField(field, instance);
-		return instance;
-	}
-	
-	@GenerateAnnotatedField(annotation = Db2Schema.class)
-	public IDb2Schema generateDb2Schema(Field field, List<Annotation> annotations) throws Db2ManagerException {
-		Db2Schema annotation = field.getAnnotation(Db2Schema.class);
-		
-		Db2InstanceImpl conn = connections.get(annotation.db2Tag());
-		if (conn == null) {
-			throw new Db2ManagerException("Requested db2 connection not valid. Please define the Db2 instance tagged: " + annotation.tag());
+
+	public String removeLicenseJarLocationFromDb2ConnectionURI(String db2url) {
+		String db2urlPrime = db2url;
+		String[] values = db2url.split(";");
+		for (String value : values) {
+			if (value.contains("db2jcc_license_cisuz.jar")) {
+				db2urlPrime.replace(";" + value, "");
+				break;
+			}
 		}
-		
-		IDb2Schema schema = new Db2SchemaImpl(framework, conn, annotation.tag(), annotation.archive(), annotation.resultSetType(), annotation.resultSetConcurrency());
-		registerAnnotatedField(field, schema);
-		return schema;
-	}
-	
-	
-	// SPI Methods 
-	@Override
-	public IDb2Instance getInstanceFromTag(String tag) throws Db2ManagerException {
-		return new Db2InstanceImpl(framework, this, tag);
+		return db2urlPrime;
 	}
 
-	@Override
-	public IDb2Schema getSchemaFromTag(String tag, String db2Tag) throws Db2ManagerException {
-		return getSchemaFromTag(tag, db2Tag, false, ResultSet.CONCUR_READ_ONLY, ResultSet.TYPE_SCROLL_INSENSITIVE);
+	private URI getFileURI(String fileString) {
+		logger.info("getFileURI(String) string = " + (fileString == null ? "null" : "-->" + fileString + "<--"));
+		System.out.println("getFileURI(String) string = " + (fileString == null ? "null" : "-->" + fileString + "<--"));
+		URI uri = null;
+		try {
+			File file = new File(fileString);
+			if (file.isFile()) {
+				try {
+					uri = file.toURI();
+				} catch (SecurityException se) {
+					logger.info("getFileURI(String) SecurityException");
+					System.out.println("getFileURI(String) SecurityException");
+					se.printStackTrace();
+				}
+			} else {
+				try {
+					URI uriCheck = new URI(fileString);
+					file = new File(uriCheck);
+					if (file.isFile()) {
+						uri = uriCheck;
+					}
+				} catch (URISyntaxException | IllegalArgumentException ue) {
+					logger.info("getFileURI(String) string was not a URI");
+					System.out.println("getFileURI(String) string was not a URI");
+					ue.printStackTrace();
+				}
+			}
+		} catch (NullPointerException npe) {
+			logger.info("getFileURI(String) string was null");
+			System.out.println("getFileURI(String) string was null");
+			npe.printStackTrace();
+		} catch (SecurityException se) {
+			logger.info("getFileURI(String) SecurityException o file constructor");
+			System.out.println("getFileURI(String) SecurityException o file constructor");
+			se.printStackTrace();
+		}
+		return uri;
 	}
 
-	@Override
-	public IDb2Schema getSchemaFromTag(String tag, String db2Tag, boolean archive) throws Db2ManagerException {
-		return getSchemaFromTag(tag, db2Tag, archive, ResultSet.CONCUR_READ_ONLY, ResultSet.TYPE_SCROLL_INSENSITIVE);
+	private BundleContext getBundleContext() {
+		return FrameworkUtil.getBundle(Db2InstanceImpl.class).getBundleContext();
 	}
 
-	@Override
-	public IDb2Schema getSchemaFromTag(String tag, String db2Tag, boolean archive, int resultSetType,
-			int resultSetConcurrency) throws Db2ManagerException {
-		Db2InstanceImpl instance = new Db2InstanceImpl(framework, this, db2Tag);
-		connections.put(db2Tag, instance);
-		
-		return new Db2SchemaImpl(framework, instance, tag, archive, resultSetType, resultSetConcurrency);
-		
+	private void install(URI fileURI) throws Exception {
+	    String fileString = fileURI.toString();
+	    Bundle bundle = getBundleContext().installBundle(fileString);
+	    bundle.start();
+	    bundle.update();
 	}
+
+	private void uninstall(URI fileURI) throws Exception {
+		String fileString = fileURI.toString();
+		Bundle bundle = getBundleContext().installBundle(fileString);
+		bundle.uninstall();
+	}
+
+	/**
+	 * Retrieves the database name from the connected database
+	 */
+	@Override
+	public String getDatabaseName() throws Db2ManagerException {
+		try {
+			Statement stmt = conn.createStatement();
+			ResultSet rs = stmt.executeQuery("VALUES CURRENT SERVER");
+			rs.next();
+			return rs.getString(1);
+		} catch (SQLException e) {
+			throw new Db2ManagerException("Failed to retrieve database name", e);
+		}
+
+	}
+
+	/**
+	 * Provides the standard java.sql.Connection
+	 */
+	public Connection getConnection() {
+		return this.conn;
+	}
+
 }
